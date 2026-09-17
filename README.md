@@ -343,3 +343,64 @@ Celery Beat, systemd timers, EventBridge, or Kubernetes cron can start or poke t
 ### It cannot make a bad handler safe
 
 If `complete_order` pays the chef without checking state, a retry or a reclaim double-pays. The library will not notice. That is the same rule as SQS, Celery, and EventBridge.
+
+---
+
+## When this is the right tool
+
+Use it when:
+
+- The work is tied to a row you already keep in Postgres (booking, order, dispute).
+- The delay is long enough that a process restart is certain (hours to months).
+- You need to change or cancel the work as data changes.
+- A minute late is acceptable.
+- The handler can check “is this still the right thing to do?”
+
+Chef Galaxy’s event close, order complete, accept-or-reject, and quiet-dispute timers are that shape.
+
+Do not use it when you need sub-second dispatch, exactly-once side effects, multi-step sagas, or a high-throughput queue. Use the tool that is for that.
+
+---
+
+## Install and run
+
+```bash
+pip install deferjob
+```
+
+```python
+# myapp/jobs.py
+from deferjob import Defer, Job
+
+jobs = Defer("postgresql://localhost/app")
+
+@jobs.job("close_event")
+def close_event(job: Job) -> None:
+    ...
+```
+
+```bash
+deferjob install --dsn postgresql://localhost/app
+deferjob worker --app myapp.jobs:jobs
+```
+
+`Defer(conninfo)` or `Defer(connect=pool.connection)` if you already have a pool. `jobs.configure(dsn)` is there for app factories that register handlers before they have a URL.
+
+---
+
+## Develop
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+pytest
+```
+
+Tests start Postgres with Docker unless `DATABASE_URL` is set.
+
+---
+
+## Status
+
+This is **0.1.0**. The idea is old and boring on purpose. The package is young. The design is what you want for far-future work. The operations around it (pooling, atomic cancel, deploy-safe unknown handlers, timeouts, retention) are still thin. Treat it as a clear table and a small worker, not as an invisible platform.
