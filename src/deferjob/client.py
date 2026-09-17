@@ -135,6 +135,51 @@ class Defer:
                 raise JobExists(f"job {key!r} is already scheduled")
             return job_from_mapping(row)
 
+    def get(
+        self,
+        *,
+        key: str | None = None,
+        id: int | None = None,
+        conn: Conn | None = None,
+    ) -> Job | None:
+        self._need_id_or_key(id, key)
+        with self._connection(conn) as c:
+            return self._get(c, id=id, key=key)
+
+    def _get(
+        self,
+        conn: Conn,
+        *,
+        id: int | None = None,
+        key: str | None = None,
+    ) -> Job | None:
+        if id is not None:
+            clause = sql.SQL("id = %(id)s")
+            params: dict[str, Any] = {"id": id}
+        else:
+            clause = sql.SQL("key = %(key)s AND status IN ('pending', 'running')")
+            params = {"key": key}
+        query = sql.SQL("SELECT {cols} FROM {t} WHERE {where}").format(
+            cols=sql.SQL(_RETURNING), t=self._t(), where=clause
+        )
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, params)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return job_from_mapping(row)
+
+    @staticmethod
+    def _need_id_or_key(id: int | None, key: str | None) -> None:
+        if (id is None) == (key is None):
+            raise ValueError("pass exactly one of id= or key=")
+
+    @staticmethod
+    def _missing_msg(id: int | None, key: str | None) -> str:
+        if id is not None:
+            return f"job id={id} not found"
+        return f"job key={key!r} not found"
+
     def _t(self) -> sql.Identifier:
         return sql.Identifier(self.table)
 
