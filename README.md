@@ -1,6 +1,6 @@
 # deferjob
 
-A small Python library for work that must happen later — hours later, or months later — and still be there when the day arrives.
+A small Python library for work that must happen later, hours later or months later, and still be there when the day arrives.
 
 The schedule lives in **Postgres**, as rows in a table. You insert a job when you book the event. You change the date when the event moves. You cancel the job when a dispute opens. A worker process asks Postgres, once a minute, “what is due?” and runs those rows.
 
@@ -34,7 +34,7 @@ A common shortcut is Celery’s `eta`: tell the worker a timestamp, walk away. T
 - Redis visibility timeout cannot tell “this worker is waiting until November” from “this worker died.” The same job gets handed out again and again, or a real crash sits unhealed for as long as your longest delay.
 - Moving the wedding means revoking a broker task id you stored on the booking. You cannot `SELECT` “everything due next week.” The schedule is a side effect you chase with ids.
 
-The thing you actually care about — *this event closes on this date* — is a fact about the booking. It should be a row next to the booking.
+The thing you actually care about (*this event closes on this date*) is a fact about the booking. It should be a row next to the booking.
 
 That is all deferjob is. Postgres remembers. A worker checks the clock.
 
@@ -150,7 +150,7 @@ A job may run up to one poll interval late (60 seconds by default). For closing 
 
 If the handler raises, the job goes back to `pending` with `run_at` pushed forward (60s, 120s, 240s, … capped at an hour). After `max_attempts` (default 5) it becomes `failed` and stays that way so you can look at `last_error`.
 
-**Why:** Networks blip. The payment API is down for two minutes. Automatic retries cover that. They should not retry forever and they should not hide the failure. A missing handler (you deployed a job name the worker does not know) is marked `failed` immediately, not retried. That is a sharp edge during rolling deploys — see below.
+**Why:** Networks blip. The payment API is down for two minutes. Automatic retries cover that. They should not retry forever and they should not hide the failure. A missing handler (you deployed a job name the worker does not know) is marked `failed` immediately, not retried. That is a sharp edge during rolling deploys. See below.
 
 ### 7. Recover a worker that died mid-job
 
@@ -181,7 +181,7 @@ reschedule() only while pending
 | `failed`    | Handler raised until `max_attempts`, or no handler is registered | No            |
 | `cancelled` | You called `cancel` while it was pending     | No                           |
 
-`get(key=...)` only returns a job that is still `pending` or `running` — the live one for that key. History (`done`, `failed`, `cancelled`) is still in the table; use `list(key=..., status="done")` or SQL.
+`get(key=...)` only returns a job that is still `pending` or `running`: the live one for that key. History (`done`, `failed`, `cancelled`) is still in the table; use `list(key=..., status="done")` or SQL.
 
 The same `key` can be scheduled again after the previous row is `done` / `failed` / `cancelled`. The unique index only covers live rows.
 
@@ -317,7 +317,7 @@ If you enqueue `name="payout_v2"` and an old worker is still running, that worke
 
 A job queued in August always runs against **November’s code**. That is a feature (you can fix the handler) and a constraint (do not put positional arguments you will rename into `payload` and then forget). Keep payloads as stable ids.
 
-### It cannot run a hung handler forever — but it also cannot stop one
+### It cannot run a hung handler forever, but it also cannot stop one
 
 There is no per-job timeout. A handler that blocks on a network call sits in `running` until `reclaim_after` (15 minutes). Then a second worker may start the same job while the first is still going. Your handler must tolerate that overlap.
 
@@ -329,7 +329,7 @@ You need a database you already trust. deferjob does not ship:
 - async
 - Django or SQLAlchemy session helpers (you can pass the raw psycopg connection)
 - a schema name (`app.defer_jobs`)
-- automatic purging of old `done` / `failed` / `cancelled` rows — the table grows until you delete them
+- automatic purging of old `done` / `failed` / `cancelled` rows (the table grows until you delete them)
 - versioned migrations (only `CREATE TABLE IF NOT EXISTS`)
 - metrics, an admin UI, or alerts when a job fails
 - `LISTEN/NOTIFY` (the worker wakes on a timer, not when you insert a near-term job)
