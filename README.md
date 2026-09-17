@@ -290,3 +290,56 @@ Errors you will see:
 | `JobNotPending` | You tried to cancel or move a job that is not waiting |
 | `UnknownJob`    | You asked for a handler name that was never registered |
 | `NotConfigured` | No connection string and no `connect=`            |
+
+---
+
+## What it cannot do
+
+This list is the product boundary, plus the current limits of this library. Read it before you put money on the path.
+
+### It is not a queue for work that should run now
+
+If the user clicks “export CSV” and a worker should start in the next second, use a queue (Celery without far-future `eta`, RQ, SQS, Postgres listen/notify queues, …). deferjob will do it if you set `run_at` to now, but it polls, runs one job after another in a single process, and opens a new database connection for each step. That is the wrong shape for a hot path.
+
+### It is not exactly-once
+
+See above. Handlers must be idempotent. There is no distributed transaction around “your side effect + mark the job done.”
+
+### It cannot stop a job that has already started
+
+`cancel` only works in `pending`. If the worker has claimed `complete_order` and a dispute lands in the same minute, cancel raises `JobNotPending` and the handler still runs. The handler has to check `order.dispute` itself.
+
+`cancel` and `reschedule` are also not one atomic `UPDATE ... WHERE status = 'pending'`. A claim can sneak in between the read and the write. Do not treat cancel as a lock on the business action.
+
+### It cannot promise a job will survive a rolling deploy unchanged
+
+If you enqueue `name="payout_v2"` and an old worker is still running, that worker does not have the handler. deferjob marks the job **failed immediately** (no retries). A new job name and an old worker is a lost job unless you drain workers or keep the old handler registered.
+
+A job queued in August always runs against **November’s code**. That is a feature (you can fix the handler) and a constraint (do not put positional arguments you will rename into `payload` and then forget). Keep payloads as stable ids.
+
+### It cannot run a hung handler forever — but it also cannot stop one
+
+There is no per-job timeout. A handler that blocks on a network call sits in `running` until `reclaim_after` (15 minutes). Then a second worker may start the same job while the first is still going. Your handler must tolerate that overlap.
+
+### It cannot hide Postgres from you
+
+You need a database you already trust. deferjob does not ship:
+
+- connection pooling on the default path (each API call may open and close a connection; pass `connect=` with a pool if you care)
+- async
+- Django or SQLAlchemy session helpers (you can pass the raw psycopg connection)
+- a schema name (`app.defer_jobs`)
+- automatic purging of old `done` / `failed` / `cancelled` rows — the table grows until you delete them
+- versioned migrations (only `CREATE TABLE IF NOT EXISTS`)
+- metrics, an admin UI, or alerts when a job fails
+- `LISTEN/NOTIFY` (the worker wakes on a timer, not when you insert a near-term job)
+- cron / repeating jobs (one `run_at` per row; to repeat, the handler schedules the next one)
+- workflows (wait, then branch, then wait again). That is Step Functions or Temporal. A dispute with several deadlines is several rows, or one row that reschedules itself.
+
+### It cannot replace “wake me up”
+
+Celery Beat, systemd timers, EventBridge, or Kubernetes cron can start or poke the worker. They should not *store* the November wedding. The schedule stays in the table. Something still has to run `jobs.run()` in a process that stays up.
+
+### It cannot make a bad handler safe
+
+If `complete_order` pays the chef without checking state, a retry or a reclaim double-pays. The library will not notice. That is the same rule as SQS, Celery, and EventBridge.
