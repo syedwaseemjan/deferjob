@@ -258,6 +258,32 @@ class Defer:
                 raise TypeError(f"run_at must be datetime, got {type(value).__name__}")
             return value
 
+    def claim(self, *, conn: Conn | None = None) -> Job | None:
+        """Mark the next due job running and return it. Safe across workers."""
+        query = sql.SQL(
+            """
+            UPDATE {t}
+            SET status = 'running',
+                attempts = attempts + 1,
+                locked_at = now(),
+                updated_at = now()
+            WHERE id = (
+                SELECT id FROM {t}
+                WHERE status = 'pending' AND run_at <= now()
+                ORDER BY run_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING {cols}
+            """
+        ).format(t=self._t(), cols=sql.SQL(_RETURNING))
+        with self._connection(conn) as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(query)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return job_from_mapping(row)
+
     def _get(
         self,
         conn: Conn,
