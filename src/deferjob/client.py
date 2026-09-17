@@ -8,8 +8,17 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
-from deferjob.errors import NotConfigured
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from deferjob.errors import JobExists, NotConfigured
+from deferjob.models import Job, job_from_mapping
 from deferjob.schema import check_table, install_sql
+
+_RETURNING = """
+    id, name, key, run_at, status, attempts, max_attempts,
+    payload, last_error, created_at, updated_at, locked_at
+"""
 
 Connect = Callable[[], Any]
 Conn = psycopg.Connection[Any]
@@ -57,6 +66,74 @@ class Defer:
     def install(self, *, conn: Conn | None = None) -> None:
         with self._connection(conn) as c:
             c.execute(install_sql(self.table))
+
+    def schedule(
+        self,
+        name: str,
+        *,
+        run_at: datetime,
+        payload: dict[str, Any] | None = None,
+        key: str | None = None,
+        max_attempts: int = 5,
+        conn: Conn | None = None,
+    ) -> Job:
+        """Insert a job. The delay lives in run_at, not in a worker process."""
+        require_aware(run_at)
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        with self._connection(conn) as c:
+            return self._insert(
+                c,
+                name=name,
+                key=key,
+                run_at=run_at,
+                payload=payload or {},
+                max_attempts=max_attempts,
+            )
+
+    def _insert(
+        self,
+        conn: Conn,
+        *,
+        name: str,
+        key: str | None,
+        run_at: datetime,
+        payload: dict[str, Any],
+        max_attempts: int,
+    ) -> Job:
+        if key is None:
+            conflict = sql.SQL("")
+        else:
+            conflict = sql.SQL(
+                """
+                ON CONFLICT (key)
+                WHERE key IS NOT NULL AND status IN ('pending', 'running')
+                DO NOTHING
+                """
+            )
+        query = sql.SQL(
+            """
+            INSERT INTO {t} (name, key, run_at, payload, max_attempts)
+            VALUES (%(name)s, %(key)s, %(run_at)s, %(payload)s, %(max_attempts)s)
+            {conflict}
+            RETURNING {cols}
+            """
+        ).format(t=self._t(), cols=sql.SQL(_RETURNING), conflict=conflict)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                query,
+                {
+                    "name": name,
+                    "key": key,
+                    "run_at": run_at,
+                    "payload": Jsonb(payload),
+                    "max_attempts": max_attempts,
+                },
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise JobExists(f"job {key!r} is already scheduled")
+            return job_from_mapping(row)
 
     def _t(self) -> sql.Identifier:
         return sql.Identifier(self.table)
