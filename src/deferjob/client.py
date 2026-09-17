@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -29,6 +30,8 @@ _RETURNING = """
 Connect = Callable[[], Any]
 Conn = psycopg.Connection[Any]
 Handler = Callable[[Job], None]
+
+log = logging.getLogger("deferjob")
 
 
 def default_backoff(attempts: int) -> timedelta:
@@ -331,6 +334,39 @@ class Defer:
         with self._connection(conn) as c, c.cursor() as cur:
             cur.execute(query, {"after": delay})
             return cur.rowcount or 0
+
+    def run_once(self) -> int:
+        """Reclaim stale work, then run every job that is already due."""
+        reclaimed = self.reclaim()
+        if reclaimed:
+            log.info("reclaimed %s stale job(s)", reclaimed)
+        ran = 0
+        while True:
+            job = self.claim()
+            if job is None:
+                break
+            self._execute(job)
+            ran += 1
+        return ran
+
+    def _execute(self, job: Job) -> None:
+        log.info("running %s id=%s attempt=%s", job.name, job.id, job.attempts)
+        handler = self._handlers.get(job.name)
+        if handler is None:
+            log.error("no handler registered for %s id=%s", job.name, job.id)
+            self._set_failed(job, f"no handler registered for {job.name!r}")
+            return
+        try:
+            handler(job)
+        except Exception as exc:
+            log.exception("job %s id=%s failed", job.name, job.id)
+            self.fail(job, exc)
+            return
+        self.complete(job)
+
+    def _set_failed(self, job: Job, message: str) -> None:
+        with self._connection() as c:
+            self._set_status(c, job.id, "failed", last_error=message)
 
     def complete(self, job: Job, *, conn: Conn | None = None) -> Job:
         with self._connection(conn) as c:
