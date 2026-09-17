@@ -399,6 +399,8 @@ pytest
 
 Tests start Postgres with Docker unless `DATABASE_URL` is set.
 
+Releases publish to PyPI through GitHub Actions (Trusted Publishing). Bump the version, then create a GitHub release named `v0.1.0` (or later). There is no upload token on a laptop.
+
 ---
 
 ## Status
