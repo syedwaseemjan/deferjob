@@ -284,6 +284,25 @@ class Defer:
                 return None
             return job_from_mapping(row)
 
+    def reclaim(
+        self, *, after: timedelta | None = None, conn: Conn | None = None
+    ) -> int:
+        """Return jobs stuck in running to pending after a crash."""
+        delay = after if after is not None else self.reclaim_after
+        query = sql.SQL(
+            """
+            UPDATE {t}
+            SET status = 'pending',
+                locked_at = NULL,
+                updated_at = now()
+            WHERE status = 'running'
+              AND locked_at < now() - %(after)s
+            """
+        ).format(t=self._t())
+        with self._connection(conn) as c, c.cursor() as cur:
+            cur.execute(query, {"after": delay})
+            return cur.rowcount or 0
+
     def complete(self, job: Job, *, conn: Conn | None = None) -> Job:
         with self._connection(conn) as c:
             return self._set_status(c, job.id, "done")
