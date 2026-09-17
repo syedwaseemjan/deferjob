@@ -284,6 +284,44 @@ class Defer:
                 return None
             return job_from_mapping(row)
 
+    def complete(self, job: Job, *, conn: Conn | None = None) -> Job:
+        with self._connection(conn) as c:
+            return self._set_status(c, job.id, "done")
+
+    def fail(
+        self, job: Job, error: BaseException | str, *, conn: Conn | None = None
+    ) -> Job:
+        message = (
+            error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        )
+        with self._connection(conn) as c:
+            if job.attempts >= job.max_attempts:
+                return self._set_status(c, job.id, "failed", last_error=message)
+            query = sql.SQL(
+                """
+                UPDATE {t}
+                SET status = 'pending',
+                    run_at = now() + %(delay)s,
+                    last_error = %(last_error)s,
+                    locked_at = NULL,
+                    updated_at = now()
+                WHERE id = %(id)s
+                RETURNING {cols}
+                """
+            ).format(t=self._t(), cols=sql.SQL(_RETURNING))
+            with c.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    query,
+                    {
+                        "id": job.id,
+                        "delay": self.backoff(job.attempts),
+                        "last_error": message,
+                    },
+                )
+                row = cur.fetchone()
+                assert row is not None
+                return job_from_mapping(row)
+
     def _get(
         self,
         conn: Conn,
