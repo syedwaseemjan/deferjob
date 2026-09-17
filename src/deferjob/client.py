@@ -11,7 +11,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from deferjob.errors import JobExists, NotConfigured
+from deferjob.errors import JobExists, JobNotFound, JobNotPending, NotConfigured
 from deferjob.models import Job, job_from_mapping
 from deferjob.schema import check_table, install_sql
 
@@ -80,21 +80,78 @@ class Defer:
         payload: dict[str, Any] | None = None,
         key: str | None = None,
         max_attempts: int = 5,
+        replace: bool = False,
         conn: Conn | None = None,
     ) -> Job:
-        """Insert a job. The delay lives in run_at, not in a worker process."""
+        """Insert a job. With key and replace=True, move an existing one."""
         require_aware(run_at)
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        body = payload or {}
         with self._connection(conn) as c:
+            if key is not None:
+                existing = self._get(c, key=key)
+                if existing is not None:
+                    if existing.status == "running":
+                        raise JobExists(
+                            f"job {key!r} is already running (id={existing.id})"
+                        )
+                    if existing.status == "pending":
+                        if not replace:
+                            raise JobExists(
+                                f"job {key!r} is already scheduled (id={existing.id})"
+                            )
+                        return self._update_pending(
+                            c,
+                            existing.id,
+                            run_at=run_at,
+                            payload=body,
+                            max_attempts=max_attempts,
+                            name=name,
+                        )
             return self._insert(
                 c,
                 name=name,
                 key=key,
                 run_at=run_at,
-                payload=payload or {},
+                payload=body,
                 max_attempts=max_attempts,
             )
+
+    def cancel(
+        self,
+        *,
+        key: str | None = None,
+        id: int | None = None,
+        conn: Conn | None = None,
+    ) -> Job:
+        """Mark a pending job cancelled. Raises if it is missing or not pending."""
+        self._need_id_or_key(id, key)
+        with self._connection(conn) as c:
+            job = self._get(c, id=id, key=key)
+            if job is None:
+                raise JobNotFound(self._missing_msg(id, key))
+            if job.status != "pending":
+                raise JobNotPending(f"job id={job.id} is {job.status}, not pending")
+            return self._set_status(c, job.id, "cancelled")
+
+    def reschedule(
+        self,
+        *,
+        run_at: datetime,
+        key: str | None = None,
+        id: int | None = None,
+        conn: Conn | None = None,
+    ) -> Job:
+        require_aware(run_at)
+        self._need_id_or_key(id, key)
+        with self._connection(conn) as c:
+            job = self._get(c, id=id, key=key)
+            if job is None:
+                raise JobNotFound(self._missing_msg(id, key))
+            if job.status != "pending":
+                raise JobNotPending(f"job id={job.id} is {job.status}, not pending")
+            return self._update_pending(c, job.id, run_at=run_at)
 
     def _insert(
         self,
@@ -222,6 +279,78 @@ class Defer:
             row = cur.fetchone()
             if row is None:
                 return None
+            return job_from_mapping(row)
+
+    def _update_pending(
+        self,
+        conn: Conn,
+        job_id: int,
+        *,
+        run_at: datetime | None = None,
+        payload: dict[str, Any] | None = None,
+        max_attempts: int | None = None,
+        name: str | None = None,
+    ) -> Job:
+        assignments = [sql.SQL("updated_at = now()")]
+        params: dict[str, Any] = {"id": job_id}
+        if run_at is not None:
+            assignments.append(sql.SQL("run_at = %(run_at)s"))
+            params["run_at"] = run_at
+        if payload is not None:
+            assignments.append(sql.SQL("payload = %(payload)s"))
+            params["payload"] = Jsonb(payload)
+        if max_attempts is not None:
+            assignments.append(sql.SQL("max_attempts = %(max_attempts)s"))
+            params["max_attempts"] = max_attempts
+        if name is not None:
+            assignments.append(sql.SQL("name = %(name)s"))
+            params["name"] = name
+        query = sql.SQL(
+            """
+            UPDATE {t}
+            SET {sets}
+            WHERE id = %(id)s AND status = 'pending'
+            RETURNING {cols}
+            """
+        ).format(
+            t=self._t(),
+            sets=sql.SQL(", ").join(assignments),
+            cols=sql.SQL(_RETURNING),
+        )
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, params)
+            row = cur.fetchone()
+            if row is None:
+                raise JobNotPending(f"job id={job_id} is not pending")
+            return job_from_mapping(row)
+
+    def _set_status(
+        self,
+        conn: Conn,
+        job_id: int,
+        status: str,
+        *,
+        last_error: str | None = None,
+    ) -> Job:
+        query = sql.SQL(
+            """
+            UPDATE {t}
+            SET status = %(status)s,
+                last_error = %(last_error)s,
+                locked_at = NULL,
+                updated_at = now()
+            WHERE id = %(id)s
+            RETURNING {cols}
+            """
+        ).format(t=self._t(), cols=sql.SQL(_RETURNING))
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                query,
+                {"id": job_id, "status": status, "last_error": last_error},
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise JobNotFound(f"job id={job_id} not found")
             return job_from_mapping(row)
 
     @staticmethod
