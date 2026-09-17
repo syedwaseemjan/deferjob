@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deferjob"
+version = "0.1.0"
+description = "Durable delayed jobs in Postgres. Schedule work months ahead."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Waseem Jan" }]
+keywords = ["postgres", "jobs", "scheduler", "deferred", "delayed"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dependencies = [
+    "psycopg[binary]>=3.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/syedwaseemjan/deferjob"
+Repository = "https://github.com/syedwaseemjan/deferjob"
+Issues = "https://github.com/syedwaseemjan/deferjob/issues"
+Blog = "https://waseem.is-a.dev/blog/scheduling-months-ahead-without-celery/"
+
+[project.scripts]
+deferjob = "deferjob.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "mypy>=1.10",
+    "ruff>=0.6",
+]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+packages = ["deferjob"]
+mypy_path = "src"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
