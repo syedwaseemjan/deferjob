@@ -23,4 +23,4 @@ __all__ = [
     "install_sql",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

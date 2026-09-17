@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deferjob"
-version = "0.1.0"
+version = "0.1.1"
 description = "Durable delayed jobs in Postgres. Schedule work months ahead."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -399,10 +399,10 @@ pytest
 
 Tests start Postgres with Docker unless `DATABASE_URL` is set.
 
-Releases publish to PyPI through GitHub Actions (Trusted Publishing). Bump the version, then create a GitHub release named `v0.1.0` (or later). There is no upload token on a laptop.
+Releases publish to PyPI through GitHub Actions (Trusted Publishing). Bump the version, then create a GitHub release named `v0.1.1` (or later). There is no upload token on a laptop.
 
 ---
 
 ## Status
 
-This is **0.1.0**. The idea is old and boring on purpose. The package is young. The design is what you want for far-future work. The operations around it (pooling, atomic cancel, deploy-safe unknown handlers, timeouts, retention) are still thin. Treat it as a clear table and a small worker, not as an invisible platform.
+This is **0.1.1**. The idea is old and boring on purpose. The package is young. The design is what you want for far-future work. The operations around it (pooling, atomic cancel, deploy-safe unknown handlers, timeouts, retention) are still thin. Treat it as a clear table and a small worker, not as an invisible platform.
