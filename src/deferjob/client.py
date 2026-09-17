@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import logging
+import signal
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from types import FrameType
 from typing import Any
 
 import psycopg
 from psycopg import sql
-
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -22,16 +24,17 @@ from deferjob.errors import (
 from deferjob.models import Job, job_from_mapping
 from deferjob.schema import check_table, install_sql
 
+log = logging.getLogger("deferjob")
+
+Handler = Callable[[Job], None]
+Backoff = Callable[[int], timedelta]
+Connect = Callable[[], Any]
+Conn = psycopg.Connection[Any]
+
 _RETURNING = """
     id, name, key, run_at, status, attempts, max_attempts,
     payload, last_error, created_at, updated_at, locked_at
 """
-
-Connect = Callable[[], Any]
-Conn = psycopg.Connection[Any]
-Handler = Callable[[Job], None]
-
-log = logging.getLogger("deferjob")
 
 
 def default_backoff(attempts: int) -> timedelta:
@@ -40,22 +43,22 @@ def default_backoff(attempts: int) -> timedelta:
     return timedelta(seconds=seconds)
 
 
-def _like_prefix(prefix: str) -> str:
-    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"{escaped}%"
-
-
 def require_aware(value: datetime, name: str = "run_at") -> datetime:
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
         raise ValueError(f"{name} must be timezone-aware")
     return value
 
 
+def _like_prefix(prefix: str) -> str:
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
+
+
 class Defer:
     """Schedule, change, and run delayed jobs stored in Postgres.
 
-    Pass a connection into mutating methods to keep the job in the same
-    transaction as the row it belongs to.
+    Pass a connection into ``schedule`` / ``cancel`` / ``reschedule`` to
+    keep the job in the same transaction as the row it belongs to.
     """
 
     def __init__(
@@ -64,7 +67,7 @@ class Defer:
         *,
         connect: Connect | None = None,
         table: str = "defer_jobs",
-        backoff: Callable[[int], timedelta] = default_backoff,
+        backoff: Backoff = default_backoff,
         reclaim_after: timedelta = timedelta(minutes=15),
         poll_interval: float = 60.0,
     ) -> None:
@@ -75,12 +78,13 @@ class Defer:
         self.reclaim_after = reclaim_after
         self.poll_interval = poll_interval
         self._handlers: dict[str, Handler] = {}
+        self._stop = False
 
     def configure(self, conninfo: str) -> None:
         self.conninfo = conninfo
 
     def job(self, name: str | Handler | None = None) -> Any:
-        """Register a handler. Use as @jobs.job or @jobs.job(\"name\")."""
+        """Register a handler. Use as ``@jobs.job`` or ``@jobs.job("name")``."""
 
         def register(fn: Handler, job_name: str) -> Handler:
             self._handlers[job_name] = fn
@@ -115,7 +119,7 @@ class Defer:
         replace: bool = False,
         conn: Conn | None = None,
     ) -> Job:
-        """Insert a job. With key and replace=True, move an existing one."""
+        """Insert a job. With ``key`` and ``replace=True``, move an existing one."""
         require_aware(run_at)
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -164,7 +168,9 @@ class Defer:
             if job is None:
                 raise JobNotFound(self._missing_msg(id, key))
             if job.status != "pending":
-                raise JobNotPending(f"job id={job.id} is {job.status}, not pending")
+                raise JobNotPending(
+                    f"job id={job.id} is {job.status}, not pending"
+                )
             return self._set_status(c, job.id, "cancelled")
 
     def reschedule(
@@ -182,52 +188,10 @@ class Defer:
             if job is None:
                 raise JobNotFound(self._missing_msg(id, key))
             if job.status != "pending":
-                raise JobNotPending(f"job id={job.id} is {job.status}, not pending")
+                raise JobNotPending(
+                    f"job id={job.id} is {job.status}, not pending"
+                )
             return self._update_pending(c, job.id, run_at=run_at)
-
-    def _insert(
-        self,
-        conn: Conn,
-        *,
-        name: str,
-        key: str | None,
-        run_at: datetime,
-        payload: dict[str, Any],
-        max_attempts: int,
-    ) -> Job:
-        if key is None:
-            conflict = sql.SQL("")
-        else:
-            conflict = sql.SQL(
-                """
-                ON CONFLICT (key)
-                WHERE key IS NOT NULL AND status IN ('pending', 'running')
-                DO NOTHING
-                """
-            )
-        query = sql.SQL(
-            """
-            INSERT INTO {t} (name, key, run_at, payload, max_attempts)
-            VALUES (%(name)s, %(key)s, %(run_at)s, %(payload)s, %(max_attempts)s)
-            {conflict}
-            RETURNING {cols}
-            """
-        ).format(t=self._t(), cols=sql.SQL(_RETURNING), conflict=conflict)
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                query,
-                {
-                    "name": name,
-                    "key": key,
-                    "run_at": run_at,
-                    "payload": Jsonb(payload),
-                    "max_attempts": max_attempts,
-                },
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise JobExists(f"job {key!r} is already scheduled")
-            return job_from_mapping(row)
 
     def get(
         self,
@@ -290,6 +254,25 @@ class Defer:
                 raise TypeError(f"run_at must be datetime, got {type(value).__name__}")
             return value
 
+    def reclaim(
+        self, *, after: timedelta | None = None, conn: Conn | None = None
+    ) -> int:
+        """Return jobs stuck in ``running`` to ``pending`` after a crash."""
+        delay = after if after is not None else self.reclaim_after
+        query = sql.SQL(
+            """
+            UPDATE {t}
+            SET status = 'pending',
+                locked_at = NULL,
+                updated_at = now()
+            WHERE status = 'running'
+              AND locked_at < now() - %(after)s
+            """
+        ).format(t=self._t())
+        with self._connection(conn) as c, c.cursor() as cur:
+            cur.execute(query, {"after": delay})
+            return cur.rowcount or 0
+
     def claim(self, *, conn: Conn | None = None) -> Job | None:
         """Mark the next due job running and return it. Safe across workers."""
         query = sql.SQL(
@@ -315,58 +298,6 @@ class Defer:
             if row is None:
                 return None
             return job_from_mapping(row)
-
-    def reclaim(
-        self, *, after: timedelta | None = None, conn: Conn | None = None
-    ) -> int:
-        """Return jobs stuck in running to pending after a crash."""
-        delay = after if after is not None else self.reclaim_after
-        query = sql.SQL(
-            """
-            UPDATE {t}
-            SET status = 'pending',
-                locked_at = NULL,
-                updated_at = now()
-            WHERE status = 'running'
-              AND locked_at < now() - %(after)s
-            """
-        ).format(t=self._t())
-        with self._connection(conn) as c, c.cursor() as cur:
-            cur.execute(query, {"after": delay})
-            return cur.rowcount or 0
-
-    def run_once(self) -> int:
-        """Reclaim stale work, then run every job that is already due."""
-        reclaimed = self.reclaim()
-        if reclaimed:
-            log.info("reclaimed %s stale job(s)", reclaimed)
-        ran = 0
-        while True:
-            job = self.claim()
-            if job is None:
-                break
-            self._execute(job)
-            ran += 1
-        return ran
-
-    def _execute(self, job: Job) -> None:
-        log.info("running %s id=%s attempt=%s", job.name, job.id, job.attempts)
-        handler = self._handlers.get(job.name)
-        if handler is None:
-            log.error("no handler registered for %s id=%s", job.name, job.id)
-            self._set_failed(job, f"no handler registered for {job.name!r}")
-            return
-        try:
-            handler(job)
-        except Exception as exc:
-            log.exception("job %s id=%s failed", job.name, job.id)
-            self.fail(job, exc)
-            return
-        self.complete(job)
-
-    def _set_failed(self, job: Job, message: str) -> None:
-        with self._connection() as c:
-            self._set_status(c, job.id, "failed", last_error=message)
 
     def complete(self, job: Job, *, conn: Conn | None = None) -> Job:
         with self._connection(conn) as c:
@@ -406,27 +337,119 @@ class Defer:
                 assert row is not None
                 return job_from_mapping(row)
 
-    def _get(
+    def run_once(self) -> int:
+        """Reclaim stale work, then run every job that is already due."""
+        reclaimed = self.reclaim()
+        if reclaimed:
+            log.info("reclaimed %s stale job(s)", reclaimed)
+        ran = 0
+        while not self._stop:
+            job = self.claim()
+            if job is None:
+                break
+            self._execute(job)
+            ran += 1
+        return ran
+
+    def run(
+        self,
+        *,
+        poll_interval: float | None = None,
+        reclaim_after: timedelta | None = None,
+    ) -> None:
+        """Poll until interrupted. A job may run up to ``poll_interval`` late."""
+        if poll_interval is not None:
+            self.poll_interval = poll_interval
+        if reclaim_after is not None:
+            self.reclaim_after = reclaim_after
+        self._stop = False
+        self._install_signals()
+        log.info("worker started, polling every %ss", self.poll_interval)
+        try:
+            while not self._stop:
+                ran = self.run_once()
+                if self._stop:
+                    break
+                if ran:
+                    continue
+                time.sleep(self._sleep_seconds())
+        finally:
+            log.info("worker stopped")
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _execute(self, job: Job) -> None:
+        log.info("running %s id=%s attempt=%s", job.name, job.id, job.attempts)
+        handler = self._handlers.get(job.name)
+        if handler is None:
+            log.error("no handler registered for %s id=%s", job.name, job.id)
+            self._set_failed(job, f"no handler registered for {job.name!r}")
+            return
+        try:
+            handler(job)
+        except Exception as exc:
+            log.exception("job %s id=%s failed", job.name, job.id)
+            self.fail(job, exc)
+            return
+        self.complete(job)
+
+    def _set_failed(self, job: Job, message: str) -> None:
+        with self._connection() as c:
+            self._set_status(c, job.id, "failed", last_error=message)
+
+    def _sleep_seconds(self) -> float:
+        nxt = self.next_run_at()
+        if nxt is None:
+            return self.poll_interval
+        now = datetime.now(tz=nxt.tzinfo)
+        wait = (nxt - now).total_seconds()
+        if wait <= 0:
+            return 0.0
+        return min(wait, self.poll_interval)
+
+    def _insert(
         self,
         conn: Conn,
         *,
-        id: int | None = None,
-        key: str | None = None,
-    ) -> Job | None:
-        if id is not None:
-            clause = sql.SQL("id = %(id)s")
-            params: dict[str, Any] = {"id": id}
+        name: str,
+        key: str | None,
+        run_at: datetime,
+        payload: dict[str, Any],
+        max_attempts: int,
+    ) -> Job:
+        if key is None:
+            conflict = sql.SQL("")
         else:
-            clause = sql.SQL("key = %(key)s AND status IN ('pending', 'running')")
-            params = {"key": key}
-        query = sql.SQL("SELECT {cols} FROM {t} WHERE {where}").format(
-            cols=sql.SQL(_RETURNING), t=self._t(), where=clause
-        )
+            conflict = sql.SQL(
+                """
+                ON CONFLICT (key)
+                WHERE key IS NOT NULL AND status IN ('pending', 'running')
+                DO NOTHING
+                """
+            )
+        query = sql.SQL(
+            """
+            INSERT INTO {t} (name, key, run_at, payload, max_attempts)
+            VALUES (%(name)s, %(key)s, %(run_at)s, %(payload)s, %(max_attempts)s)
+            {conflict}
+            RETURNING {cols}
+            """
+        ).format(t=self._t(), cols=sql.SQL(_RETURNING), conflict=conflict)
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query, params)
+            cur.execute(
+                query,
+                {
+                    "name": name,
+                    "key": key,
+                    "run_at": run_at,
+                    "payload": Jsonb(payload),
+                    "max_attempts": max_attempts,
+                },
+            )
             row = cur.fetchone()
             if row is None:
-                return None
+                raise JobExists(f"job {key!r} is already scheduled")
             return job_from_mapping(row)
 
     def _update_pending(
@@ -472,6 +495,29 @@ class Defer:
                 raise JobNotPending(f"job id={job_id} is not pending")
             return job_from_mapping(row)
 
+    def _get(
+        self,
+        conn: Conn,
+        *,
+        id: int | None = None,
+        key: str | None = None,
+    ) -> Job | None:
+        if id is not None:
+            clause = sql.SQL("id = %(id)s")
+            params: dict[str, Any] = {"id": id}
+        else:
+            clause = sql.SQL("key = %(key)s AND status IN ('pending', 'running')")
+            params = {"key": key}
+        query = sql.SQL("SELECT {cols} FROM {t} WHERE {where}").format(
+            cols=sql.SQL(_RETURNING), t=self._t(), where=clause
+        )
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, params)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return job_from_mapping(row)
+
     def _set_status(
         self,
         conn: Conn,
@@ -500,17 +546,6 @@ class Defer:
             if row is None:
                 raise JobNotFound(f"job id={job_id} not found")
             return job_from_mapping(row)
-
-    @staticmethod
-    def _need_id_or_key(id: int | None, key: str | None) -> None:
-        if (id is None) == (key is None):
-            raise ValueError("pass exactly one of id= or key=")
-
-    @staticmethod
-    def _missing_msg(id: int | None, key: str | None) -> str:
-        if id is not None:
-            return f"job id={id} not found"
-        return f"job key={key!r} not found"
 
     def _t(self) -> sql.Identifier:
         return sql.Identifier(self.table)
@@ -548,3 +583,26 @@ class Defer:
             raise
         finally:
             owned.close()
+
+    def _install_signals(self) -> None:
+        def handle(_signum: int, _frame: FrameType | None) -> None:
+            log.info("stop requested")
+            self._stop = True
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, handle)
+            except ValueError:
+                # Not the main thread.
+                return
+
+    @staticmethod
+    def _need_id_or_key(id: int | None, key: str | None) -> None:
+        if (id is None) == (key is None):
+            raise ValueError("pass exactly one of id= or key=")
+
+    @staticmethod
+    def _missing_msg(id: int | None, key: str | None) -> str:
+        if id is not None:
+            return f"job id={id} not found"
+        return f"job key={key!r} not found"
