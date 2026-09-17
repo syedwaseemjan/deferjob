@@ -30,6 +30,11 @@ def default_backoff(attempts: int) -> timedelta:
     return timedelta(seconds=seconds)
 
 
+def _like_prefix(prefix: str) -> str:
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
+
+
 def require_aware(value: datetime, name: str = "run_at") -> datetime:
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
         raise ValueError(f"{name} must be timezone-aware")
@@ -145,6 +150,56 @@ class Defer:
         self._need_id_or_key(id, key)
         with self._connection(conn) as c:
             return self._get(c, id=id, key=key)
+
+    def list(
+        self,
+        *,
+        status: str | None = None,
+        key: str | None = None,
+        key_prefix: str | None = None,
+        limit: int = 100,
+        conn: Conn | None = None,
+    ) -> list[Job]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        clauses = [sql.SQL("TRUE")]
+        params: dict[str, Any] = {"limit": limit}
+        if status is not None:
+            clauses.append(sql.SQL("status = %(status)s"))
+            params["status"] = status
+        if key is not None:
+            clauses.append(sql.SQL("key = %(key)s"))
+            params["key"] = key
+        if key_prefix is not None:
+            clauses.append(sql.SQL("key LIKE %(key_prefix)s ESCAPE '\\'"))
+            params["key_prefix"] = _like_prefix(key_prefix)
+        query = sql.SQL(
+            "SELECT {cols} FROM {t} WHERE {where} "
+            "ORDER BY run_at, id LIMIT %(limit)s"
+        ).format(
+            cols=sql.SQL(_RETURNING),
+            t=self._t(),
+            where=sql.SQL(" AND ").join(clauses),
+        )
+        with self._connection(conn) as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, params)
+            return [job_from_mapping(row) for row in cur.fetchall()]
+
+    def next_run_at(self, *, conn: Conn | None = None) -> datetime | None:
+        query = sql.SQL(
+            "SELECT min(run_at) AS run_at FROM {t} WHERE status = 'pending'"
+        ).format(t=self._t())
+        with self._connection(conn) as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(query)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            value = row["run_at"]
+            if value is None:
+                return None
+            if not isinstance(value, datetime):
+                raise TypeError(f"run_at must be datetime, got {type(value).__name__}")
+            return value
 
     def _get(
         self,
