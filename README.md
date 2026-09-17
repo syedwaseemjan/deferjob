@@ -37,3 +37,123 @@ A common shortcut is Celery’s `eta`: tell the worker a timestamp, walk away. T
 The thing you actually care about — *this event closes on this date* — is a fact about the booking. It should be a row next to the booking.
 
 That is all deferjob is. Postgres remembers. A worker checks the clock.
+
+---
+
+## What it does, and why
+
+### 1. Store the job as a row
+
+Scheduling is an `INSERT` into `defer_jobs`.
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from deferjob import Defer, Job
+
+jobs = Defer("postgresql://localhost/app")
+jobs.install()
+
+jobs.schedule(
+    "close_event",
+    run_at=datetime(2024, 11, 12, 9, 0, tzinfo=ZoneInfo("UTC")),
+    payload={"event_id": 42},
+    key="event:42:close",
+)
+```
+
+**Why:** A row survives deploys, new machines, and Redis failovers. You can open psql and see it. You can back it up with the rest of the database. The delay is the `run_at` column, not a process that has to stay alive until November.
+
+`run_at` must be timezone-aware. Naive datetimes are rejected. Scheduling is a clock problem; guessing the timezone is how you close a wedding on the wrong day.
+
+`payload` should be identifiers (`event_id`, `order_id`), not a copy of the order as it looked in August. In November the handler loads the live row.
+
+### 2. Give the job a name you chose (`key`)
+
+`key` is optional, but it is the way you should talk about a job.
+
+```text
+event:42:close
+order:99:complete
+dispute:7:autoresolve
+```
+
+**Why:** In the Celery version, every table grew a `*_task_id` column that pointed at a message inside the broker. To move a date you had to find that id and hope `revoke` reached the worker holding it.
+
+Here the key *is* the name. One pending job per key (enforced by a unique index). You do not store a broker id on the booking.
+
+### 3. Move a date, or cancel, like any other data
+
+```python
+jobs.reschedule(key="event:42:close", run_at=new_end)
+jobs.cancel(key="order:99:complete")
+jobs.list(key_prefix="event:42:")
+```
+
+**Why:** Customers move weddings. Disputes open. “What is still scheduled for this booking?” is a product question. Those are updates and selects, not control-plane RPCs to a worker fleet.
+
+`cancel` and `reschedule` only work while the job is **pending**. If a worker has already claimed it (`running`), these calls raise `JobNotPending`. They do not stop a handler that is already in progress. See [What it cannot do](#what-it-cannot-do).
+
+### 4. Put the job in the same transaction as the booking
+
+```python
+with psycopg.connect(DSN) as conn:
+    booking_id = insert_booking(conn, ...)
+    jobs.schedule(
+        "close_event",
+        run_at=event_ends_at,
+        payload={"event_id": booking_id},
+        key=f"event:{booking_id}:close",
+        conn=conn,
+    )
+    conn.commit()
+```
+
+**Why:** You do not want a booking with no close job, or a close job with no booking. If the request fails after the insert, both roll back.
+
+If you pass `conn=`, deferjob **does not commit it**. That connection is yours. If you omit `conn=`, deferjob opens its own connection and commits.
+
+### 5. Run what is due, without holding the future in memory
+
+A worker process loops:
+
+1. Give back jobs stuck in `running` for too long (a worker crashed mid-job).
+2. Ask Postgres for the next pending row whose `run_at` is in the past.
+3. Mark it `running` and run your handler.
+4. Mark it `done`, or put it back as `pending` for a retry, or mark it `failed`.
+
+```python
+@jobs.job("close_event")
+def close_event(job: Job) -> None:
+    event = events.get(job.payload["event_id"])
+    if event.already_closed:
+        return
+    event.close()
+
+
+jobs.run()  # process; polls about every 60 seconds
+```
+
+Or:
+
+```bash
+deferjob worker --app myapp.jobs:jobs
+```
+
+**Why:** The worker can die at any time. The November jobs are not inside it. They are still pending rows. The next worker will see them when November comes.
+
+Several workers can run at once. Claiming uses `FOR UPDATE SKIP LOCKED`: if one worker has a row, the next worker skips it and takes a different one. They do not block each other.
+
+A job may run up to one poll interval late (60 seconds by default). For closing an event or paying a chef the next day, a minute does not matter. Still having the job in November does.
+
+### 6. Retry a failed handler, then stop
+
+If the handler raises, the job goes back to `pending` with `run_at` pushed forward (60s, 120s, 240s, … capped at an hour). After `max_attempts` (default 5) it becomes `failed` and stays that way so you can look at `last_error`.
+
+**Why:** Networks blip. The payment API is down for two minutes. Automatic retries cover that. They should not retry forever and they should not hide the failure. A missing handler (you deployed a job name the worker does not know) is marked `failed` immediately, not retried. That is a sharp edge during rolling deploys — see below.
+
+### 7. Recover a worker that died mid-job
+
+When a job is claimed, `locked_at` is set. If the process is killed, the row stays `running`. After `reclaim_after` (15 minutes by default), another worker sets it back to `pending` and someone else can take it.
+
+**Why:** This is the correct use of a visibility timeout. It answers “how long do we wait before assuming this in-flight run is dead?” It does **not** answer “how far ahead may I schedule?” Those are different questions. Celery-on-Redis conflates them. deferjob does not. A job scheduled for November does not need a three-month timeout.
