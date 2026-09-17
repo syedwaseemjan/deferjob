@@ -261,3 +261,32 @@ Indexes:
 - `locked_at` on running rows (so reclaim is cheap)
 
 Default table name is `defer_jobs`. You can pass `table="..."` if you need another name. It must be a simple identifier, not `schema.table`.
+
+---
+
+## API in short
+
+| You want to…                         | Call                                      |
+| ------------------------------------ | ----------------------------------------- |
+| Create the table                     | `jobs.install()` or `install_sql()`       |
+| Register a handler                   | `@jobs.job("close_event")`                |
+| Schedule work                        | `jobs.schedule(name, run_at=..., ...)`    |
+| Replace an existing pending job      | `schedule(..., key=..., replace=True)`    |
+| Move the time                        | `jobs.reschedule(key=..., run_at=...)`    |
+| Stop a pending job                   | `jobs.cancel(key=...)`                    |
+| Read the live job                    | `jobs.get(key=...)` or `get(id=...)`      |
+| List by booking, status, etc.        | `jobs.list(key_prefix=..., status=...)`   |
+| Run due jobs once (tests, cron)      | `jobs.run_once()`                         |
+| Run until the process is stopped     | `jobs.run()` or `deferjob worker`         |
+
+`schedule` / `cancel` / `reschedule` / `get` / `list` all take optional `conn=` so they can share your transaction.
+
+Errors you will see:
+
+| Error           | When                                              |
+| --------------- | ------------------------------------------------- |
+| `JobExists`     | That `key` already has a pending or running job   |
+| `JobNotFound`   | No matching id, or no live job for that key       |
+| `JobNotPending` | You tried to cancel or move a job that is not waiting |
+| `UnknownJob`    | You asked for a handler name that was never registered |
+| `NotConfigured` | No connection string and no `connect=`            |
