@@ -157,3 +157,53 @@ If the handler raises, the job goes back to `pending` with `run_at` pushed forwa
 When a job is claimed, `locked_at` is set. If the process is killed, the row stays `running`. After `reclaim_after` (15 minutes by default), another worker sets it back to `pending` and someone else can take it.
 
 **Why:** This is the correct use of a visibility timeout. It answers “how long do we wait before assuming this in-flight run is dead?” It does **not** answer “how far ahead may I schedule?” Those are different questions. Celery-on-Redis conflates them. deferjob does not. A job scheduled for November does not need a three-month timeout.
+
+---
+
+## The life of a job
+
+```text
+schedule() ──► pending ──► running ──► done
+                 │            │
+                 │            ├── handler error, attempts left ──► pending (later)
+                 │            └── handler error, no attempts left ──► failed
+                 │
+                 └── cancel() ──► cancelled
+
+reschedule() only while pending
+```
+
+| Status      | Meaning                                      | You can cancel / reschedule? |
+| ----------- | -------------------------------------------- | ---------------------------- |
+| `pending`   | Waiting for `run_at`                         | Yes                          |
+| `running`   | A worker has claimed it                      | No                           |
+| `done`      | Handler returned without raising             | No                           |
+| `failed`    | Handler raised until `max_attempts`, or no handler is registered | No            |
+| `cancelled` | You called `cancel` while it was pending     | No                           |
+
+`get(key=...)` only returns a job that is still `pending` or `running` — the live one for that key. History (`done`, `failed`, `cancelled`) is still in the table; use `list(key=..., status="done")` or SQL.
+
+The same `key` can be scheduled again after the previous row is `done` / `failed` / `cancelled`. The unique index only covers live rows.
+
+---
+
+## How the worker claims a row
+
+This is the query. It is the whole trick.
+
+```sql
+UPDATE defer_jobs
+SET status = 'running', attempts = attempts + 1, locked_at = now()
+WHERE id = (
+    SELECT id FROM defer_jobs
+    WHERE status = 'pending' AND run_at <= now()
+    ORDER BY run_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING *;
+```
+
+`SKIP LOCKED` means “if another worker already has this row in a transaction, do not wait, take the next one.” Postgres shipped that in 9.5.
+
+The future work is never loaded into the worker until it is due. Ten workers and twenty November events does not mean twenty Python objects living in RAM from August.
