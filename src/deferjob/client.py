@@ -11,7 +11,13 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from deferjob.errors import JobExists, JobNotFound, JobNotPending, NotConfigured
+from deferjob.errors import (
+    JobExists,
+    JobNotFound,
+    JobNotPending,
+    NotConfigured,
+    UnknownJob,
+)
 from deferjob.models import Job, job_from_mapping
 from deferjob.schema import check_table, install_sql
 
@@ -22,6 +28,7 @@ _RETURNING = """
 
 Connect = Callable[[], Any]
 Conn = psycopg.Connection[Any]
+Handler = Callable[[Job], None]
 
 
 def default_backoff(attempts: int) -> timedelta:
@@ -64,9 +71,31 @@ class Defer:
         self.backoff = backoff
         self.reclaim_after = reclaim_after
         self.poll_interval = poll_interval
+        self._handlers: dict[str, Handler] = {}
 
     def configure(self, conninfo: str) -> None:
         self.conninfo = conninfo
+
+    def job(self, name: str | Handler | None = None) -> Any:
+        """Register a handler. Use as @jobs.job or @jobs.job(\"name\")."""
+
+        def register(fn: Handler, job_name: str) -> Handler:
+            self._handlers[job_name] = fn
+            return fn
+
+        if callable(name):
+            return register(name, name.__name__)
+
+        def decorator(fn: Handler) -> Handler:
+            return register(fn, name or fn.__name__)
+
+        return decorator
+
+    def handler(self, name: str) -> Handler:
+        try:
+            return self._handlers[name]
+        except KeyError:
+            raise UnknownJob(f"no handler registered for {name!r}") from None
 
     def install(self, *, conn: Conn | None = None) -> None:
         with self._connection(conn) as c:
