@@ -356,7 +356,7 @@ Use it when:
 - A minute late is acceptable.
 - The handler can check “is this still the right thing to do?”
 
-Chef Galaxy’s event close, order complete, accept-or-reject, and quiet-dispute timers are that shape.
+Closing an event on its date, completing an order a few hours later, auto-rejecting a booking nobody accepted, and resolving a quiet dispute are that shape.
 
 Do not use it when you need sub-second dispatch, exactly-once side effects, multi-step sagas, or a high-throughput queue. Use the tool that is for that.
 
