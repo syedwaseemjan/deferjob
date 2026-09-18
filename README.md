@@ -405,4 +405,4 @@ Releases publish to PyPI through GitHub Actions (Trusted Publishing). Bump the v
 
 ## Status
 
-This is **0.1.1**. The idea is old and boring on purpose. The package is young. The design is what you want for far-future work. The operations around it (pooling, atomic cancel, deploy-safe unknown handlers, timeouts, retention) are still thin. Treat it as a clear table and a small worker, not as an invisible platform.
+**0.1.1** stores future work in a table and a small worker runs what is due, and you still handle shared database connections, jobs that have already started, and old finished rows yourself
